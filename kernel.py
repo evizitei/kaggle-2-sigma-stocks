@@ -21,68 +21,98 @@ class StockStateMachine(object):
         #   - 5 zeros
         return np.zeros(5)
 
-    def preload_news_state(self, ndf):
-        for idx, row in ndf.iterrows():
-            ac = row['assetCodes']
-            codes = ac.replace("{", "").replace("'", "").replace("}", "").split(",")
-            for code in codes:
-                if code not in self.asset_state:
-                    self.asset_state[code] = self.empty_record()
-                self.asset_state[code][2] = row['sentimentPositive']
-                self.asset_state[code][3] = row['sentimentNegative']
-
-    def process_day_state(self, mdf, ndf, cur_ts, last_ts):
-        day_market_data = mdf[mdf['time'] == cur_ts]
-        day_news_data = ndf[(ndf['time'] >= last_ts) & (news_df['time'] <= cur_ts)]
-        self.preload_news_state(day_news_data)
-        rows = []
-        for idx, row in day_market_data.iterrows():
-            code = row['assetCode']
+    def process_news_row(self, row):
+        ac = row[1]
+        codes = ac.replace("{", "").replace("'", "").replace("}", "").split(",")
+        for code in codes:
             if code not in self.asset_state:
                 self.asset_state[code] = self.empty_record()
-            self.asset_state[code][0] = row['returnsOpenPrevMktres1']
-            self.asset_state[code][1] = row['returnsOpenPrevMktres10']
-            self.asset_state[code][4] = row['returnsOpenNextMktres10']
-            rows.append(self.asset_state[code])
-        return np.array(rows)
+            self.asset_state[code][2] = row[2] # pos sentiment
+            self.asset_state[code][3] = row[3] # neg sentiment
+
+    def process_market_row(self, row):
+        code = row[1]
+        if code not in self.asset_state:
+            self.asset_state[code] = self.empty_record()
+        self.asset_state[code][0] = row[2] # prev 1 market res
+        self.asset_state[code][1] = row[3] # prev 10 market res
+        self.asset_state[code][4] = row[4] # next 10 market res
+
+    def preload_news_state(self, ndf):
+        for idx, row in ndf.iterrows():
+            self.process_news_row(row)
+
+    def process_day_state(self, m_rows, n_rows):
+        for n_row in n_rows:
+            self.process_news_row(n_row)
+        day_rows = []
+        for m_row in m_rows:
+            self.process_market_row(m_row)
+            day_rows.append(self.asset_state[m_row[1]])
+        return np.array(day_rows)
 
 
 
-def produce_training_set(mdf, ndf):
+def produce_training_set(mdf, ndf, already_arrays=False):
     """
     Iterate through each day window,
     update current state of each stock in universe,
     dump state to raw array
     append to training set
     """
-    cur_ts = mdf.iloc[0]['time']
-    news_ts = ndf.iloc[0]['time']
-    last_ts = mdf.iloc[len(market_df) - 1][0]
-    # pre-load state with news information from before the commencement
-    # of trading windows
-    pre_news = ndf[ndf['time'] < cur_ts]
     machine = StockStateMachine()
-    print("Caching News State...")
-    machine.preload_news_state(pre_news)
-    print("Preloaded State size: ", len(machine.asset_state))
-    prev_ts = cur_ts
-    training_set = machine.process_day_state(mdf, ndf, cur_ts, prev_ts)
-    cur_ts = cur_ts + timedelta(hours=24)
+    #print("Caching News State...")
+    #machine.preload_news_state(pre_news)
+    #print("Preloaded State size: ", len(machine.asset_state))
+    #prev_ts = cur_ts
+    #training_set = machine.process_day_state(mdf, ndf, cur_ts, prev_ts)
+    #cur_ts = cur_ts + timedelta(hours=24)
     print("processing day windows...")
+    # get iterators for both dataframes
+    training_set = None
+    m_i = 0
+    m_bound = len(mdf)
+    n_i = 0
+    n_bound = len(ndf)
     i = 0
-    # change iteration strategy to step through each row in order until the TS changes,
-    # then snapshot
-    while cur_ts <= last_ts:
+    print("Transforming DF to arrays...", datetime.now())
+    m_vals = mdf[['time','assetCode','returnsOpenPrevMktres1','returnsOpenPrevMktres10','returnsOpenNextMktres10']].values
+    n_vals = ndf[['time','assetCodes','sentimentPositive','sentimentNegative']].values
+    print("initializing rows...", datetime.now())
+    m_row = m_vals[0]
+    n_row = n_vals[0]
+    while m_i < m_bound:
+        m_rows = []
+        cur_ts = m_row[0] # time
+        print("Parsing Markets: ", cur_ts, datetime.now())
+        while m_row[0] == cur_ts:
+            m_rows.append(m_row)
+            m_i += 1
+            if m_i >= m_bound:
+                break
+            m_row = m_vals[m_i]
+        print("Market Window: ", len(m_rows))
+        n_rows = []
+        print("Parsing News Til: ", cur_ts, datetime.now())
+        while n_row[0] <= cur_ts:
+            n_rows.append(n_row)
+            n_i += 1
+            if n_i >= n_bound:
+                break
+            n_row = n_vals[n_i]
+            if n_i % 10 == 0:
+                print("n_i ", n_i, "row time", n_row[0])
+        print("News Window: ", len(n_rows))
+        print("Processing Window Rows...", datetime.now())
+        ts_rows = machine.process_day_state(m_rows, n_rows)
         i += 1
-        new_day_rows = machine.process_day_state(mdf, ndf, cur_ts, prev_ts)
-        if len(new_day_rows) > 0:
-            training_set = np.concatenate((training_set, new_day_rows))
-        prev_ts = cur_ts
-        cur_ts = cur_ts + timedelta(hours=24)
-        if i % 10 == 0:
-            print("...days ", i, "...")
-            print("Current Shape: ", training_set.shape, datetime.now())
-            print("Current TS", cur_ts)
+        if training_set is None:
+            training_set = ts_rows
+        elif len(ts_rows > 0):
+            training_set = np.concatenate((training_set, ts_rows))
+        print("...days ", i, "...")
+        print("Current Shape: ", training_set.shape, datetime.now())
+        print("Current TS", cur_ts)
     print("Dataset Shape: ", training_set.shape)
     return training_set
 
@@ -92,7 +122,3 @@ env = twosigmanews.make_env()
 (market_df, news_df) = env.get_training_data()
 
 ts = produce_training_set(market_df, news_df)
-
-cur_ts = market_df.iloc[0]['time']
-last_ts = cur_ts
-rows = machine.process_day_state(market_df, news_df, cur_ts, (cur_ts + timedelta(hours=24)))
